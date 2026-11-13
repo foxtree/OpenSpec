@@ -222,6 +222,10 @@ export const COMMAND_REGISTRY: CommandDefinition[] = [
         name: 'json',
         description: 'Output as JSON (non-interactive)',
       },
+      {
+        name: 'dry-run',
+        description: 'Report what archiving would do without changing any file',
+      },
       COMMON_FLAGS.store,
     ],
   },

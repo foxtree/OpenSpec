@@ -687,6 +687,7 @@ openspec archive [change-name] [options]
 | `-y, --yes` | Skip confirmation prompts. Required when nothing can answer them — an AI agent, a CI job, or any run with stdin closed |
 | `--skip-specs` | Skip spec updates for one archive run. A change that permanently has no spec deltas should declare `skip_specs: true` in its `.openspec.yaml` instead — it archives with no flag |
 | `--no-validate` | Skip validation (requires confirmation). Also disables capability retirement — with no validator verdict, nothing is retired |
+| `--dry-run` | Run every check archive runs before writing, as `--yes` would, and change no file. Exits 0 when the archive would succeed and non-zero with archive's own refusal when it would not. Needs a change name. With `--json`, the output is what `archive --json --yes` prints, plus `"dryRun": true` |
 
 **Examples:**
 
@@ -702,6 +703,9 @@ openspec archive add-dark-mode --yes
 
 # Archive a tooling change that doesn't affect specs
 openspec archive update-ci-config --skip-specs
+
+# Check that a change still archives cleanly, without archiving it (CI)
+openspec archive add-dark-mode --dry-run --json
 ```
 
 **Retire a capability:** Add the retirement marker to the change metadata:

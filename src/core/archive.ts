@@ -188,6 +188,12 @@ export interface ArchiveOptions {
   noValidate?: boolean;
   validate?: boolean;
   json?: boolean;
+  /**
+   * Run every check archive runs before writing, as `--yes` would, and stop
+   * before the first write. Nothing on disk changes; the result says what a
+   * real archive would do, or carries the refusal it would give.
+   */
+  dryRun?: boolean;
   store?: string;
   storePath?: string;
 }
@@ -1296,6 +1302,10 @@ async function finalizeRetirementBackups(
 export class ArchiveCommand {
   async execute(changeName?: string, options: ArchiveOptions = {}): Promise<void> {
     const json = !!options.json;
+    const dryRun = options.dryRun === true;
+    // A dry run answers "would the unattended archive succeed?", so every
+    // confirmation is answered the way --yes answers it, and none is shown.
+    if (dryRun) options = { ...options, yes: true };
 
     let root: ResolvedOpenSpecRoot;
     try {
@@ -1305,7 +1315,7 @@ export class ArchiveCommand {
       });
     } catch (error) {
       if (json && isRootSelectionError(error)) {
-        this.printJsonFailure(undefined, toArchiveDiagnostic(error));
+        this.printJsonFailure(undefined, toArchiveDiagnostic(error), dryRun);
         return;
       }
       throw error;
@@ -1317,9 +1327,15 @@ export class ArchiveCommand {
         if (!result) {
           return;
         }
-        console.log(JSON.stringify({ archive: result, root: toRootOutput(root) }, null, 2));
+        console.log(
+          JSON.stringify(
+            { ...(dryRun ? { dryRun: true } : {}), archive: result, root: toRootOutput(root) },
+            null,
+            2
+          )
+        );
       } catch (error) {
-        this.printJsonFailure(root, toArchiveDiagnostic(error));
+        this.printJsonFailure(root, toArchiveDiagnostic(error), dryRun);
       }
       return;
     }
@@ -1328,10 +1344,15 @@ export class ArchiveCommand {
     await this.run(changeName, options, root, false);
   }
 
-  private printJsonFailure(root: ResolvedOpenSpecRoot | undefined, diagnostic: ArchiveDiagnostic): void {
+  private printJsonFailure(
+    root: ResolvedOpenSpecRoot | undefined,
+    diagnostic: ArchiveDiagnostic,
+    dryRun = false
+  ): void {
     console.log(
       JSON.stringify(
         {
+          ...(dryRun ? { dryRun: true } : {}),
           archive: null,
           ...(root ? { root: toRootOutput(root) } : {}),
           status: [diagnostic],
@@ -1357,6 +1378,7 @@ export class ArchiveCommand {
     const changesDir = root.changesDir;
     const archiveDir = root.archiveDir;
     const mainSpecsDir = root.specsDir;
+    const dryRun = options.dryRun === true;
 
     const openspecDir = path.dirname(changesDir);
 
@@ -1384,6 +1406,14 @@ export class ArchiveCommand {
 
     // Get change name interactively if not provided
     if (!changeName) {
+      // The change list is a prompt, and a dry run never prompts.
+      if (dryRun) {
+        throw new ArchiveBlockedError(
+          'archive_change_name_required',
+          'A change name is required: archive --dry-run never prompts.',
+          withStoreFlag(root, `openspec archive <change-name> --dry-run${json ? ' --json' : ''}`)
+        );
+      }
       if (json) {
         throw new ArchiveBlockedError(
           'archive_change_name_required',
@@ -1647,7 +1677,11 @@ export class ArchiveCommand {
           return null;
         }
       } else {
-        console.log(`Warning: ${incompleteTasks} incomplete task(s) found. Continuing due to --yes flag.`);
+        console.log(
+          dryRun
+            ? `Warning: ${incompleteTasks} incomplete task(s) found. A dry run continues as --yes would.`
+            : `Warning: ${incompleteTasks} incomplete task(s) found. Continuing due to --yes flag.`
+        );
       }
     }
 
@@ -1675,7 +1709,7 @@ export class ArchiveCommand {
       : undefined;
 
     await assertArchiveDestinationAvailable(archivePath, archiveName);
-    await fs.mkdir(archiveDir, { recursive: true });
+    if (!dryRun) await fs.mkdir(archiveDir, { recursive: true });
     const claimPath = archiveClaimPath(archivePath, archiveName);
     let archiveClaim: ArchiveClaim | undefined;
 
@@ -1685,6 +1719,29 @@ export class ArchiveCommand {
       let totals: ArchiveResult['totals'];
       const specWarnings: string[] = [];
       let changeArchived = false;
+      const announceArchived = (): void => {
+        if (json) return;
+        if (dryRun) {
+          console.log(`Would archive change '${changeName}' as '${archiveName}'.`);
+          console.log('Dry run: no files were changed.');
+        } else {
+          console.log(`Change '${changeName}' archived as '${archiveName}'.`);
+        }
+      };
+      const buildResult = (): ArchiveResult => ({
+        change: changeName!,
+        archivedAs: archiveName,
+        path: archivePath,
+        specsUpdated,
+        ...(totals ? { totals } : {}),
+        ...(specWarnings.length > 0 || unknownMetadataWarning
+          ? {
+              warnings: unknownMetadataWarning
+                ? [...specWarnings, unknownMetadataWarning]
+                : specWarnings,
+            }
+          : {}),
+      });
       if (options.skipSpecs) {
       if (!json) {
         console.log('Skipping spec updates (--skip-specs flag provided).');
@@ -1966,6 +2023,69 @@ export class ArchiveCommand {
                 return null;
               }
             }
+          }
+
+          // A dry run stops here. Every check that depends on the change has
+          // run, and everything below writes: the destination claim, the
+          // snapshots, the spec writes, the retirements and the move.
+          if (dryRun) {
+            const wouldTotals = { added: 0, modified: 0, removed: 0, renamed: 0 };
+            let wouldChange = false;
+            for (const p of prepared) {
+              if (p.outcome === 'skip') continue;
+              const { added, modified, removed, renamed } = p.counts;
+              // Every operation already synced: archive leaves the file alone.
+              if (p.outcome === 'write' && added + modified + removed + renamed === 0) continue;
+              wouldChange = true;
+              wouldTotals.added += added;
+              wouldTotals.modified += modified;
+              wouldTotals.removed += removed;
+              wouldTotals.renamed += renamed;
+              // The same path archive prints when it writes or retires.
+              const nominal = isStoreSelectedRoot(root)
+                ? p.update.target
+                : `openspec/specs/${p.update.id}/spec.md`;
+              if (p.outcome === 'retire') {
+                // Recorded as a real retirement is, so a JSON consumer learns
+                // which file would be deleted; nothing is, so no recovery
+                // command is offered.
+                const relativeToRoot = path.relative(root.path, p.update.target);
+                const insideRoot =
+                  relativeToRoot !== '' &&
+                  !relativeToRoot.startsWith('..') &&
+                  !path.isAbsolute(relativeToRoot);
+                const shownPath =
+                  isStoreSelectedRoot(root) || !insideRoot
+                    ? p.update.target
+                    : relativeToRoot.split(path.sep).join('/');
+                specWarnings.push(
+                  `${p.update.id} - capability would be retired; archive would delete the main spec ` +
+                    `(all requirements removed, declared by retire_capabilities) at ${shownPath}. ` +
+                    'Its section(s) would go with it: Purpose.'
+                );
+                if (!json) console.log(`Would retire ${nominal}: all requirements removed.`);
+              } else if (!json) {
+                console.log(`Would apply changes to ${nominal}:`);
+                if (added) console.log(`  + ${added} added`);
+                if (modified) console.log(`  ~ ${modified} modified`);
+                if (removed) console.log(`  - ${removed} removed`);
+                if (renamed) console.log(`  → ${renamed} renamed`);
+              }
+            }
+            specsUpdated = wouldChange;
+            totals = wouldTotals;
+            if (!json) {
+              console.log(
+                `Totals: + ${wouldTotals.added}, ~ ${wouldTotals.modified}, - ${wouldTotals.removed}, → ${wouldTotals.renamed}`
+              );
+              console.log(
+                wouldChange
+                  ? 'Specs would be updated.'
+                  : 'Specs already in sync; nothing would be written.'
+              );
+            }
+            announceArchived();
+            return buildResult();
           }
 
           // A legitimate concurrent archive cannot pass the exclusive claim,
@@ -2312,7 +2432,9 @@ export class ArchiveCommand {
       // The destination was checked before the merge, so anything claiming it now
     // appeared while we were working. Report that as the collision it is: a raw
     // ENOTEMPTY from rename would otherwise degrade to a bare `archive_error`.
-      if (!changeArchived) {
+      // A dry run with no spec to write (--skip-specs, or no deltas) ends here
+      // too: claiming the destination and moving the change are writes.
+      if (!changeArchived && !dryRun) {
         await assertArchiveDestinationAvailable(archivePath, archiveName);
         archiveClaim = await claimArchiveDestination(archivePath, archiveName);
         await assertArchiveDestinationAvailable(archivePath, archiveName);
@@ -2325,24 +2447,8 @@ export class ArchiveCommand {
         changeArchived = true;
       }
 
-      if (!json) {
-        console.log(`Change '${changeName}' archived as '${archiveName}'.`);
-      }
-
-      return {
-        change: changeName,
-        archivedAs: archiveName,
-        path: archivePath,
-        specsUpdated,
-        ...(totals ? { totals } : {}),
-        ...(specWarnings.length > 0 || unknownMetadataWarning
-          ? {
-              warnings: unknownMetadataWarning
-                ? [...specWarnings, unknownMetadataWarning]
-                : specWarnings,
-            }
-          : {}),
-      };
+      announceArchived();
+      return buildResult();
     } finally {
       if (archiveClaim) await releaseArchiveClaim(archiveClaim, claimPath).catch(() => undefined);
     }
